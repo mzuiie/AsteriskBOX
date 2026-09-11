@@ -1,0 +1,11 @@
+# 内置快照示例（开源仓库不含真实订阅凭据）
+# 在免流页「内置快照」导入前, 请替换为你的机场订阅内容（Clash YAML proxies 格式）
+port: 7890
+socks-port: 7891
+proxies:
+  - { name: '示例节点-香港', type: ss, server: example.com, port: 8443, cipher: aes-128-gcm, password: your-airport-password, udp: true }
+  - { name: '示例节点-日本', type: ss, server: example.org, port: 8443, cipher: aes-128-gcm, password: your-airport-password, udp: true }
+proxy-groups:
+  - { name: PROXY, type: select, proxies: ['示例节点-香港', '示例节点-日本'] }
+rules:
+  - MATCH,PROXY

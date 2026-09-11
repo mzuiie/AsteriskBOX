@@ -1,0 +1,324 @@
+
+// Copyright 2026, AsteriskBOX contributors
+// SPDX-License-Identifier: GPL-3.0
+
+package engine.root.runtime
+
+import android.content.Context
+import engine.proxy.ProxyEngineStatus
+import engine.root.config.RootStartConfig
+import engine.root.daemon.AsteriskdClient
+import engine.root.daemon.config.AsteriskdConfig
+import engine.root.daemon.config.AsteriskdConfigEncoder
+import engine.root.daemon.config.AsteriskdMode
+import engine.root.daemon.config.AsteriskdOwner
+import engine.root.daemon.control.AsteriskdControlCodec
+import engine.root.daemon.control.AsteriskdControlResponse
+import engine.root.daemon.control.AsteriskdResultCode
+import engine.root.daemon.control.AsteriskdSnapshot
+import engine.root.publication.RootBootConfigWriter
+import engine.root.publication.RootBootPublicationCommand
+import engine.root.publication.RootPublicationBundle
+import engine.root.publication.RootPublicationCommand
+import engine.root.publication.RootPublicationLaunchMode
+import engine.root.publication.RootServiceLogCleanupWarningPrefix
+import engine.root.publication.RootPublicationStager
+import engine.root.publication.prepareRootPublicationDirectories
+import engine.root.publication.rootRuntimeLayout
+import features.logs.AndroidAppLogger
+import features.logs.clearServiceLogRepositories
+import kotlinx.coroutines.flow.Flow
+import utils.shellQuote
+import kotlinx.coroutines.withTimeoutOrNull
+import system.RootShellGateway
+import system.ShellExecOptions
+import system.ShellExecResult
+import kotlin.time.Duration.Companion.milliseconds
+
+internal class RootSupervisorController(
+    context: Context,
+    private val shell: RootShellGateway,
+) {
+    private val appContext = context.applicationContext
+    private val runtimeLayout = appContext.rootRuntimeLayout()
+    private val client = AsteriskdClient(shell)
+    suspend fun status(): AsteriskdControlResponse = client.status(runtimeLayout.asteriskdPath)
+
+    fun observeStatus(): Flow<AsteriskdSnapshot> = client.observeStatus(runtimeLayout.asteriskdPath)
+
+    suspend fun preflightStart(expectedMode: AsteriskdMode, explicitRestart: Boolean): AsteriskdSnapshot? {
+        return status().preflightStart(AsteriskdOwner.AsteriskBox, expectedMode, explicitRestart)
+    }
+
+    suspend fun ownsRuntime(): Boolean = status().boundSnapshot()?.owner == AsteriskdOwner.AsteriskBox
+
+    suspend fun proxyStatus(runMode: Int, expectedMode: AsteriskdMode): ProxyEngineStatus {
+        val snapshot = status().boundSnapshot() ?: return ProxyEngineStatus(running = false, runMode = runMode)
+        return snapshot.toProxyEngineStatus(runMode, expectedMode)
+    }
+
+    fun proxyStatus(snapshot: AsteriskdSnapshot, runMode: Int, expectedMode: AsteriskdMode): ProxyEngineStatus =
+        snapshot.toProxyEngineStatus(runMode, expectedMode)
+
+    fun requireRunning(snapshot: AsteriskdSnapshot, expectedMode: AsteriskdMode) {
+        snapshot.requireRunning(AsteriskdOwner.AsteriskBox, expectedMode)
+    }
+
+    suspend fun start(
+        root: RootStartConfig,
+        config: AsteriskdConfig,
+    ): AsteriskdSnapshot {
+        status().boundSnapshot()?.let { snapshot ->
+            val disposition = snapshot.ordinaryStartDisposition(AsteriskdOwner.AsteriskBox, config.mode)
+            if (disposition == RootOrdinaryStartDisposition.Reuse) return snapshot
+            if (disposition.shutdownBeforeLaunch) shutdownOwn()
+            return launch(
+                root = root,
+                config = config,
+                restartExpectedOwner = snapshot.owner,
+                launchMode = RootPublicationLaunchMode.Service,
+            )
+        }
+
+        return launch(root, config, restartExpectedOwner = null, RootPublicationLaunchMode.Service)
+    }
+
+    suspend fun restart(
+        root: RootStartConfig,
+        config: AsteriskdConfig,
+    ): AsteriskdSnapshot {
+        val snapshot = status().boundSnapshot()
+        if (snapshot != null && snapshot.owner != AsteriskdOwner.AsteriskBox) {
+            throw RootRuntimeConflictException(snapshot)
+        }
+        return launch(
+            root = root,
+            config = config,
+            restartExpectedOwner = snapshot?.owner,
+            launchMode = RootPublicationLaunchMode.Service,
+        )
+    }
+
+    suspend fun reconfigureServiceControl(
+        root: RootStartConfig,
+        config: AsteriskdConfig,
+    ): Boolean {
+        val snapshot = status().boundSnapshot()
+        if (snapshot != null && snapshot.owner != AsteriskdOwner.AsteriskBox) {
+            throw RootRuntimeConflictException(snapshot)
+        }
+        val plan = try {
+            serviceControlReconfigurePlan(snapshot?.phase, config.serviceControl.enabled)
+        } catch (_: IllegalArgumentException) {
+            throw RootRuntimeBusyException(requireNotNull(snapshot))
+        }
+        if (plan.shutdownRequired) shutdownOwn()
+        when (plan.launchMode) {
+            RootPublicationLaunchMode.Service -> launch(
+                root,
+                config,
+                restartExpectedOwner = snapshot?.owner,
+                launchMode = RootPublicationLaunchMode.Service,
+            )
+            RootPublicationLaunchMode.Monitor -> launch(
+                root,
+                config,
+                restartExpectedOwner = snapshot?.owner,
+                launchMode = RootPublicationLaunchMode.Monitor,
+            )
+            RootPublicationLaunchMode.None -> Unit
+        }
+        return plan.launchMode == RootPublicationLaunchMode.Service
+    }
+
+    private suspend fun launch(
+        root: RootStartConfig,
+        config: AsteriskdConfig,
+        restartExpectedOwner: AsteriskdOwner?,
+        launchMode: RootPublicationLaunchMode,
+    ): AsteriskdSnapshot {
+        preparePublication()
+        val staged = RootPublicationStager.stage(
+            root.publicationStagingDirectory,
+            root.singBoxConfigBytes,
+            AsteriskdConfigEncoder.encode(config),
+        )
+        staged.use { staged ->
+            val publication = RootPublicationCommand.build(
+                RootPublicationBundle(
+                    runtimeLayout = runtimeLayout,
+                    coreConfigSourcePath = staged.coreConfig.absolutePath,
+                    asteriskdConfigSourcePath = staged.asteriskdConfig.absolutePath,
+                    bootEnabled = root.enableBoot,
+                    launchMode = launchMode,
+                    restartExpectedOwner = restartExpectedOwner?.wireValue,
+                ),
+            )
+            clearInMemoryServiceLogs()
+            val launchResult = shell.exec(publication, ShellExecOptions(logFailure = false))
+            reportServiceLogCleanupFailures(launchResult.stderr)
+            if (launchResult.errno != 0 || launchResult.stdout.isNotBlank()) {
+                throw launchFailure(launchResult)
+            }
+            val snapshot = withTimeoutOrNull(StartTimeoutMilliseconds.milliseconds) {
+                when (launchMode) {
+                    RootPublicationLaunchMode.Service -> client.awaitRunning(runtimeLayout.asteriskdPath)
+                    RootPublicationLaunchMode.Monitor -> client.awaitStopped(runtimeLayout.asteriskdPath)
+                    RootPublicationLaunchMode.None -> error("A non-launch publication has no runtime snapshot")
+                }
+            } ?: throw IllegalStateException(
+                "asteriskd did not reach the requested phase before timeout" +
+                    readAsteriskdFailureEvidence(),
+            )
+            if (snapshot.owner != AsteriskdOwner.AsteriskBox) throw RootRuntimeConflictException(snapshot)
+            require(snapshot.mode == config.mode) { "Unexpected ROOT mode ${snapshot.mode.wireValue}" }
+            return snapshot
+        }
+    }
+
+    suspend fun stopOwn(): AsteriskdControlResponse {
+        val initial = status()
+        val initialSnapshot = initial.boundSnapshot() ?: return initial
+        if (initialSnapshot.owner != AsteriskdOwner.AsteriskBox) {
+            throw RootRuntimeConflictException(initialSnapshot)
+        }
+        val result = shell.exec(RootStopOwnCommand.build(runtimeLayout), ShellExecOptions(logFailure = false))
+        val response = AsteriskdControlCodec.decodeShellResponse(result)
+        when (response.requestId) {
+            "status" -> response.boundSnapshot()?.let { snapshot ->
+                if (snapshot.owner != AsteriskdOwner.AsteriskBox) throw RootRuntimeConflictException(snapshot)
+            }
+            "stop" -> Unit
+            else -> error("Unexpected stop-own response id")
+        }
+        if (response.result.code == AsteriskdResultCode.Ok || response.result.code == AsteriskdResultCode.NotRunning) {
+            return response
+        }
+        error(response.result.message ?: "Failed to stop asteriskd")
+    }
+
+    suspend fun shutdownOwn(): AsteriskdControlResponse {
+        val initial = status()
+        val initialSnapshot = initial.boundSnapshot() ?: return initial
+        if (initialSnapshot.owner != AsteriskdOwner.AsteriskBox) {
+            throw RootRuntimeConflictException(initialSnapshot)
+        }
+        val result = shell.exec(
+            RootShutdownOwnCommand.build(runtimeLayout),
+            ShellExecOptions(logFailure = false),
+        )
+        val response = AsteriskdControlCodec.decodeShellResponse(result)
+        when (response.requestId) {
+            "status" -> response.boundSnapshot()?.let { snapshot ->
+                if (snapshot.owner != AsteriskdOwner.AsteriskBox) {
+                    throw RootRuntimeConflictException(snapshot)
+                }
+            }
+            "shutdown", "stop" -> Unit
+            else -> error("Unexpected shutdown-own response id")
+        }
+        if (response.result.code == AsteriskdResultCode.Ok ||
+            response.result.code == AsteriskdResultCode.NotRunning
+        ) {
+            return response
+        }
+        error(response.result.message ?: "Failed to shutdown asteriskd")
+    }
+
+    suspend fun publishBoot(
+        root: RootStartConfig,
+        config: AsteriskdConfig,
+    ) {
+        preparePublication()
+        RootBootConfigWriter.write(
+            layout = runtimeLayout,
+            coreConfigBytes = root.singBoxConfigBytes,
+            encodedDaemonConfig = AsteriskdConfigEncoder.encode(config),
+        )
+        val result = shell.exec(
+            RootBootPublicationCommand.buildInstallation(runtimeLayout),
+            ShellExecOptions(logFailure = false),
+        )
+        requirePublicationSuccess(result)
+    }
+
+    private fun requirePublicationSuccess(result: ShellExecResult) {
+        if (result.errno != 0 || result.stdout.isNotBlank()) throw launchFailure(result)
+    }
+
+    suspend fun removeBoot() {
+        val result = shell.exec(
+            RootBootPublicationCommand.buildRemoval(runtimeLayout),
+            ShellExecOptions(logFailure = false),
+        )
+        requirePublicationSuccess(result)
+    }
+
+    private fun launchFailure(result: ShellExecResult): IllegalStateException {
+        val controlResponse = result.controlResponseOrNull()
+        controlResponse?.result?.snapshot?.rejectBound(AsteriskdOwner.AsteriskBox)
+        val message = controlResponse?.result?.message ?: sanitizeLauncherStderr(result.stderr)
+            .ifBlank { "asteriskd launcher exited with ${result.errno}" }
+        return IllegalStateException(message)
+    }
+
+    private fun preparePublication() {
+        appContext.prepareRootPublicationDirectories()
+    }
+
+    /** 启动失败时附带 asteriskd 日志尾部：daemon 侧失败原因直接进异常与应用日志。 */
+    private suspend fun readAsteriskdFailureEvidence(): String = runCatching {
+        val output = shell.exec(
+            "tail -n 40 " + runtimeLayout.asteriskdLogPath.shellQuote() + " 2>/dev/null || true",
+            ShellExecOptions(logFailure = false),
+        ).stdout.trim()
+        if (output.isEmpty()) "" else "\n--- asteriskd log tail ---\n" + output
+    }.onFailure { error ->
+        if (error is kotlinx.coroutines.CancellationException) throw error
+    }.getOrDefault("")
+
+        private fun clearInMemoryServiceLogs() {
+        runCatching { clearServiceLogRepositories() }.onFailure { error ->
+            runCatching { AndroidAppLogger.warn(LogTag, "Failed to clear in-memory service logs", error) }
+        }
+    }
+
+    private fun reportServiceLogCleanupFailures(stderr: String) {
+        stderr.lineSequence()
+            .filter { line -> line.startsWith(RootServiceLogCleanupWarningPrefix) }
+            .forEach { warning -> runCatching { AndroidAppLogger.warn(LogTag, warning) } }
+    }
+
+}
+
+private const val LogTag = "RootSupervisorController"
+
+internal fun sanitizeLauncherStderr(stderr: String): String {
+    val retained = mutableListOf<String>()
+    var readingFileContexts = false
+    stderr.lineSequence().forEach { line ->
+        if (line.startsWith(RootServiceLogCleanupWarningPrefix)) return@forEach
+        if (line.trim() == "SELinux: Loaded file context from:") {
+            readingFileContexts = true
+            return@forEach
+        }
+        val trimmed = line.trim()
+        if (
+            readingFileContexts &&
+            trimmed.startsWith('/') &&
+            "/selinux/" in trimmed &&
+            trimmed.endsWith("_file_contexts")
+        ) {
+            return@forEach
+        }
+        readingFileContexts = false
+        retained += line
+    }
+    val stderrWithoutCleanupWarnings = stderr.lineSequence()
+        .filterNot { line -> line.startsWith(RootServiceLogCleanupWarningPrefix) }
+        .joinToString("\n")
+        .trim()
+    return retained.joinToString("\n").trim().ifBlank { stderrWithoutCleanupWarnings }
+}
+
+private const val StartTimeoutMilliseconds = 15_000L

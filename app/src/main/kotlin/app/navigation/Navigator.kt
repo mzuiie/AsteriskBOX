@@ -1,0 +1,111 @@
+// Copyright 2026, AsteriskBOX contributors
+// SPDX-License-Identifier: GPL-3.0
+
+package app.navigation
+
+import androidx.navigation3.runtime.NavKey
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+
+/**
+ * Simple navigation helper that owns a back stack and result channels.
+ * Supports push/replace/pop/popUntil and result APIs: navigateForResult/setResult/observeResult/clearResult.
+ */
+class Navigator(
+    val backStack: MutableList<NavKey>,
+) {
+    private val resultBus = mutableMapOf<String, MutableSharedFlow<Any>>()
+    private val pendingResultRoutes = mutableMapOf<String, Route>()
+
+    /**
+     * Push a key onto the back stack.
+     */
+    fun push(key: NavKey) {
+        backStack.add(key)
+    }
+
+    /**
+     * Replace the top key, or push if the stack is empty.
+     */
+    fun replace(key: NavKey) {
+        if (backStack.isNotEmpty()) {
+            clearPendingResultsFor(backStack.last())
+            backStack[backStack.lastIndex] = key
+        } else {
+            backStack.add(key)
+        }
+    }
+
+    /**
+     * Pop the top key if present.
+     */
+    fun pop() {
+        if (backStack.size > 1) {
+            clearPendingResultsFor(backStack.last())
+            backStack.removeLastOrNull()
+        }
+    }
+
+    /**
+     * Pop until predicate matches the top key.
+     */
+    fun popUntil(predicate: (NavKey) -> Boolean) {
+        while (backStack.size > 1 && !predicate(backStack.last())) {
+            pop()
+        }
+    }
+
+    /**
+     * Navigate expecting a result. Caller should subscribe via observeResult(requestKey).
+     */
+    fun navigateForResult(route: Route, requestKey: String) {
+        ensureChannel(requestKey)
+        pendingResultRoutes[requestKey] = route
+        push(route)
+    }
+
+    /**
+     * Set a result for the given request and then pop.
+     */
+    fun <T : Any> setResult(requestKey: String, value: T) {
+        val pendingRoute = pendingResultRoutes[requestKey] ?: return
+        if (current() !== pendingRoute) return
+        pendingResultRoutes.remove(requestKey)
+        ensureChannel(requestKey).tryEmit(value)
+        pop()
+    }
+
+    /**
+     * Observe results for a given request key as a SharedFlow.
+     */
+    @Suppress("UNCHECKED_CAST")
+    fun <T : Any> observeResult(requestKey: String): SharedFlow<T> = ensureChannel(requestKey) as SharedFlow<T>
+
+    /**
+     * Clear the last emitted result for the request key.
+     */
+    fun clearResult(requestKey: String) {
+        pendingResultRoutes.remove(requestKey)
+        resultBus.remove(requestKey)
+    }
+
+    fun hasResultRequest(requestKey: String): Boolean =
+        requestKey in pendingResultRoutes || requestKey in resultBus
+
+    fun current() = backStack.lastOrNull()
+
+    fun backStackSize() = backStack.size
+
+    private fun ensureChannel(key: String): MutableSharedFlow<Any> = resultBus.getOrPut(key) { MutableSharedFlow(replay = 1, extraBufferCapacity = 0) }
+
+    private fun clearPendingResultsFor(route: NavKey) {
+        val requestKeys = pendingResultRoutes
+            .filterValues { pendingRoute -> pendingRoute === route }
+            .keys
+            .toList()
+        requestKeys.forEach { requestKey ->
+            pendingResultRoutes.remove(requestKey)
+            resultBus.remove(requestKey)
+        }
+    }
+}

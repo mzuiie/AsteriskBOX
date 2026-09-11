@@ -1,0 +1,117 @@
+// Copyright 2026, AsteriskBOX contributors
+// SPDX-License-Identifier: GPL-3.0
+
+package features.settings
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import app.AppState
+import app.modes.RunModeTun
+import features.settings.sheets.sanitizeIgnoredInterfaceSelectors
+import features.settings.sheets.sanitizeExternalInterfaces
+import features.settings.sheets.sanitizePrivateAddressCidrs
+import features.settings.sheets.sanitizeEbpfSharedNetworkInterfaces
+import features.settings.sheets.sanitizeEbpfBypassRuleSetTags
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+
+internal class SettingsSheetState(
+    private val updateAppState: ((AppState) -> AppState) -> Unit,
+) {
+    var showLocalProxySettings by mutableStateOf(false)
+    var localProxySettingsDraft by mutableStateOf(LocalProxySettingsDraft())
+
+    var showTunSettings by mutableStateOf(false)
+    var tunSettingsDraft by mutableStateOf(TunSettingsDraft())
+
+    var showSnifferSettings by mutableStateOf(false)
+    var snifferSettingsDraft by mutableStateOf(SnifferSettingsDraft())
+
+    var showExternalInterfaces by mutableStateOf(false)
+    var externalInterfacesDraft by mutableStateOf(emptyList<String>())
+
+    var showIgnoredInterfaces by mutableStateOf(false)
+    var ignoredInterfacesDraft by mutableStateOf(emptyList<String>())
+
+    var showServiceControl by mutableStateOf(false)
+    var serviceControlDraft by mutableStateOf(app.ServiceControlSettings())
+
+    var showPrivateAddresses by mutableStateOf(false)
+    var privateAddressCidrsDraft by mutableStateOf(emptyList<String>())
+
+    var showEbpfSharedNetwork by mutableStateOf(false)
+    var ebpfSharedNetworkInterfacesDraft by mutableStateOf(emptyList<String>())
+
+    var showEbpfBypassRuleSets by mutableStateOf(false)
+    var ebpfBypassRuleSetTagsDraft by mutableStateOf(emptyList<String>())
+
+    fun openLocalProxySettings(appState: AppState) {
+        localProxySettingsDraft = appState.toLocalProxySettingsDraft()
+        showLocalProxySettings = true
+    }
+
+    fun openTunSettings(appState: AppState) {
+        tunSettingsDraft = appState.toTunSettingsDraft()
+        showTunSettings = true
+    }
+
+    fun openSnifferSettings(appState: AppState) {
+        snifferSettingsDraft = appState.toSnifferSettingsDraft()
+        showSnifferSettings = true
+    }
+
+    fun openExternalInterfaces(appState: AppState) {
+        val sanitizedInterfaces = appState.externalInterfaces.sanitizeExternalInterfaces()
+        externalInterfacesDraft = sanitizedInterfaces
+        if (sanitizedInterfaces != appState.externalInterfaces) {
+            updateAppState { state -> state.copy(externalInterfaces = sanitizedInterfaces) }
+        }
+        showExternalInterfaces = true
+    }
+
+    fun openIgnoredInterfaces(appState: AppState) {
+        ignoredInterfacesDraft = appState.ignoredInterfaces.sanitizeIgnoredInterfaceSelectors()
+        showIgnoredInterfaces = true
+    }
+
+    fun openServiceControl(appState: AppState) {
+        serviceControlDraft = appState.serviceControl
+        showServiceControl = true
+    }
+
+    fun closeIgnoredInterfaces() {
+        showIgnoredInterfaces = false
+    }
+
+    fun openPrivateAddresses(appState: AppState) {
+        val sanitizedCidrs = appState.privateAddressCidrs.sanitizePrivateAddressCidrs()
+        privateAddressCidrsDraft = sanitizedCidrs
+        if (sanitizedCidrs != appState.privateAddressCidrs) {
+            updateAppState { state -> state.copy(privateAddressCidrs = sanitizedCidrs) }
+        }
+        showPrivateAddresses = true
+    }
+
+    fun openEbpfSharedNetwork(appState: AppState) {
+        ebpfSharedNetworkInterfacesDraft =
+            (if (appState.runMode == RunModeTun) appState.tunSharedNetworkInterfaces else appState.ebpfSharedNetworkInterfaces)
+                .sanitizeEbpfSharedNetworkInterfaces()
+        showEbpfSharedNetwork = true
+    }
+
+    fun openEbpfBypassRuleSets(appState: AppState) {
+        ebpfBypassRuleSetTagsDraft =
+            sanitizeEbpfBypassRuleSetTags(
+                if (appState.runMode == RunModeTun) appState.tunBypassRuleSetTags else appState.ebpfBypassRuleSetTags,
+            )
+        showEbpfBypassRuleSets = true
+    }
+}
+
+@Composable
+internal fun rememberSettingsSheetState(
+    updateAppState: ((AppState) -> AppState) -> Unit,
+): SettingsSheetState {
+    return remember(updateAppState) { SettingsSheetState(updateAppState) }
+}

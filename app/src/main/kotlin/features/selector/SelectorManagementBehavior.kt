@@ -1,0 +1,178 @@
+// Copyright 2026, AsteriskBOX contributors
+// SPDX-License-Identifier: GPL-3.0
+
+package features.selector
+
+import app.AppState
+import app.DefaultSingBoxUrlTestIdleTimeout
+import app.DefaultSingBoxUrlTestInterval
+import app.DefaultSingBoxUrlTestUrl
+import app.ManagedOutboundChoice
+import app.SingBoxSelectorTypeSelector
+import app.SingBoxSelectorTypeUrlTest
+import app.SingBoxSelectorState
+import app.SupportedSingBoxSelectorTypes
+import app.nextAvailableSelectorId
+import app.selectableManagedOutbounds
+import engine.singbox.SingBoxUnsigned16Max
+import engine.singbox.isNonNegativeSingBoxDuration
+import engine.singbox.isSingBoxDurationNotGreaterThan
+import java.net.URI
+
+internal fun selectorTargetChoices(
+    state: AppState,
+    selectorId: Int = 0,
+): List<ManagedOutboundChoice> = selectableManagedOutbounds(
+    state = state,
+    excludedTag = state.selectors.firstOrNull { selector -> selector.id == selectorId }?.tag.orEmpty(),
+    excludedSelectorId = selectorId,
+    includeGlobalSelector = false,
+).sortedBy(ManagedOutboundChoice::selectorTargetPriority)
+
+internal fun selectorCardMemberCount(memberTags: Iterable<String>): Int = memberTags.count()
+
+internal fun selectorCardMemberCount(
+    state: AppState,
+    selector: SingBoxSelectorState,
+): Int {
+    val targets = selectorTargetChoices(state = state, selectorId = selector.id)
+    return selectorEffectiveMemberTags(
+        state = state,
+        memberReferences = selector.outbounds,
+        targets = targets,
+    ).size
+}
+
+internal fun List<SingBoxSelectorState>.moveSelector(
+    fromIndex: Int,
+    toIndex: Int,
+): List<SingBoxSelectorState> {
+    if (fromIndex !in indices || toIndex !in indices || fromIndex == toIndex) return this
+    return toMutableList().apply {
+        add(toIndex, removeAt(fromIndex))
+    }
+}
+
+internal fun selectorCustomSectionIndexOffset(managedSelectorCount: Int): Int =
+    if (managedSelectorCount > 0) managedSelectorCount + 2 else 1
+
+internal fun isSelectorReorderEnabled(
+    query: String,
+    selectorCount: Int,
+): Boolean = query.isBlank() && selectorCount > 1
+
+internal fun selectorDefaultMemberIndex(
+    members: List<String>,
+    default: String,
+): Int = members.indexOf(default).coerceAtLeast(0)
+
+internal fun AppState.withSavedSelector(
+    draft: SingBoxSelectorState,
+): AppState {
+    val normalized = validateSelectorDraft(this, draft)
+    val original = selectors.firstOrNull { selector -> selector.id == normalized.id }
+    val saved = if (original == null) {
+        normalized.copy(id = nextAvailableSelectorId())
+    } else {
+        normalized
+    }
+    return copy(
+        selectors = if (original == null) {
+            selectors + saved
+        } else {
+            selectors.map { selector ->
+                if (selector.id == saved.id) saved else selector
+            }
+        },
+        nextSelectorId = if (original == null) {
+            maxOf(nextSelectorId, saved.id + 1)
+        } else {
+            nextSelectorId
+        },
+    )
+}
+
+internal fun validateSelectorDraft(
+    state: AppState,
+    draft: SingBoxSelectorState,
+): SingBoxSelectorState {
+    val type = draft.type.trim().lowercase()
+    require(type in SupportedSingBoxSelectorTypes) { "Unsupported selector type" }
+    val remarks = draft.remarks.trim()
+    require(remarks.isNotEmpty()) { "Selector remarks are required" }
+
+    val availableTargets = selectorTargetChoices(
+        state = state,
+        selectorId = draft.id,
+    )
+    val requestedMembers = draft.outbounds
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .toSet()
+    val memberReferences = availableTargets
+        .map(ManagedOutboundChoice::tag)
+        .filter(requestedMembers::contains)
+    require(memberReferences.size == requestedMembers.size) {
+        "Selector contains an unavailable outbound"
+    }
+    val members = selectorEffectiveMemberTags(
+        state = state,
+        memberReferences = memberReferences,
+        targets = availableTargets,
+    )
+    require(members.isNotEmpty()) { "Selector requires at least one outbound" }
+    return when (type) {
+        SingBoxSelectorTypeSelector -> {
+            val default = draft.default.trim().ifBlank { members.first() }
+            require(default in members) { "Selector default must be a member" }
+            draft.copy(
+                type = type,
+                remarks = remarks,
+                outbounds = memberReferences,
+                default = default,
+            )
+        }
+        SingBoxSelectorTypeUrlTest -> {
+            val url = draft.url.trim().ifBlank { DefaultSingBoxUrlTestUrl }
+            val interval = draft.interval.trim().ifBlank { DefaultSingBoxUrlTestInterval }
+            val idleTimeout = draft.idleTimeout.trim()
+                .ifBlank { DefaultSingBoxUrlTestIdleTimeout }
+            require(isValidUrlTestUrl(url)) { "URLTest URL is invalid" }
+            require(isValidSingBoxDuration(interval)) { "URLTest interval is invalid" }
+            require(draft.tolerance in 0..SingBoxUnsigned16Max) {
+                "URLTest tolerance is invalid"
+            }
+            require(isValidSingBoxDuration(idleTimeout)) { "URLTest idle timeout is invalid" }
+            require(isSingBoxDurationNotGreaterThan(interval, idleTimeout)) {
+                "URLTest interval must not exceed idle timeout"
+            }
+            draft.copy(
+                type = type,
+                remarks = remarks,
+                outbounds = memberReferences,
+                default = "",
+                url = url,
+                interval = interval,
+                idleTimeout = idleTimeout,
+            )
+        }
+        else -> error("Unreachable selector type")
+    }
+}
+
+internal fun isValidUrlTestUrl(value: String): Boolean {
+    val uri = runCatching { URI(value.trim()) }.getOrNull() ?: return false
+    if (uri.scheme !in setOf("http", "https")) return false
+    if (!uri.host.isNullOrBlank()) return true
+    val authority = uri.rawAuthority?.substringAfterLast('@') ?: return false
+    if (authority.any(Char::isWhitespace)) return false
+    val host = when {
+        authority.startsWith('[') -> authority.substringAfter('[').substringBefore(']')
+        authority.count { it == ':' } <= 1 -> authority.substringBefore(':')
+        else -> ""
+    }
+    return host.isNotBlank()
+}
+
+internal fun isValidSingBoxDuration(value: String): Boolean =
+    isNonNegativeSingBoxDuration(value)
